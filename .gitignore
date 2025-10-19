@@ -1,6 +1,8 @@
+/venv
 /etc
 /Include
 /Lib
 /Scripts
 /share
 /pyvenv.cfg
+/src/.env

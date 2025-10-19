@@ -1,280 +1,226 @@
-from dotenv import load_dotenv
+from fastapi import FastAPI, Body, Depends, File, UploadFile, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from contextlib import asynccontextmanager
 import os
-load_dotenv('./.env')
-
-from flask import Flask, request, Response, jsonify 
-from google import genai
-from google.genai import types
-from pinecone import Pinecone
 import uuid
-import requests
-import PyPDF2
-import time
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from typing import List
+import asyncio
+
+from services.content_extraction import file_parser
+from services.content_processing import getChunks, generateEmbeddings
+from services.ai_init import init_genai, get_genai_client
+from services.pinecone import connect_to_pinecone, upsert_records, get_pinecone, query_records
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print(f"== Initializing services ==")
+    
+    await connect_to_pinecone()
+    await init_genai()
+    
+    print(f"== All of the services initialized successfuly ==")
+
+    yield
+    print(f"== Services closed ==")
+
+app = FastAPI(
+    title = "Diploma Project API", 
+    version = "1.0.0",
+    lifespan = lifespan
+)
+
+@app.get("/")
+async def hello():
+    return {"message": "Hello from Diploma Project API!"}
 
 
-app = Flask(__name__)
-
-
-def preProcessDocument(rawContent: str) -> str:
-    lines = rawContent.splitlines()
-
-    cleanedLines = []
-    for line in lines:
-        if line.strip() == '':
-            continue
-        cleanedLines.append(line.strip())
-
-    cleanContent = ''.join(cleanedLines)
-    return cleanContent
-
-
-def splitDocument(PDFcontent: str) -> List[str]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
-    )
-    chunks = splitter.split_text(PDFcontent)
-    return chunks
-
-
-def embedChunks(chunk: str) -> List[float]:
-    txt_embedding_endpoint = os.getenv('TXT_EMBEDDING_ENDPOINT') 
-    txt_embedding_api_key = os.getenv('TXT_EMBEDDING_API')
-
+@app.post("/fileProcessing")
+async def file_processing(file: UploadFile = File(...)):
+    """Process the uploaded file and store vectors in Pinecone DB."""
     try:
-        response = requests.post(
-            txt_embedding_endpoint,
-            json = {
-                'input': [chunk]
+        # Save file locally
+        os.makedirs("storedFiles", exist_ok = True)
+        file_path = os.path.join("storedFiles", file.filename)
+
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        # Validate file size
+        file_size_mb = len(content) / (1024 * 1024)
+        if file_size_mb > 3:
+            raise HTTPException(
+                status_code = 400,
+                detail = f"File too large ({file_size_mb:.2f} MB). Max allowed is 3 MB.",
+            )
+
+        # Detect file extension
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        print(f"== file extension is: {file_extension} ==")
+
+        # File parsing
+        match file_extension:
+            case ".pdf":
+                extracted_content = await file_parser.using_llm(content, "pdf")
+            case ".csv":
+                extracted_content = await file_parser.using_llm(content, "csv")
+            case ".docx":
+                extracted_content = await file_parser.basic_docx(content)
+            case _:
+                raise HTTPException(
+                    status_code = 400,
+                    detail = f"Unsupported file type '{file_extension}'. Only PDF, CSV, and DOCX are supported.",
+                )
+
+        # Generate chunks and embeddings
+        print("== Calculating chunks and embeddings ==")
+        chunks = getChunks(extracted_content)
+
+        batch_size = 20
+        tasks = []
+
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:i + batch_size]  
+            tasks.append(generateEmbeddings(batch))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        embeddings = []
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"== Error generating embeddings: {result} ==")
+                raise HTTPException(
+                    status_code = 500,
+                    detail = "Error occurred during embedding generation.",
+                )
+            for embedding in result:
+                embeddings.append(embedding)
+
+        if len(chunks) != len(embeddings):
+            raise HTTPException(
+                status_code = 500,
+                detail = "Size mismatch between chunks and embeddings.",
+            )
+
+        # Prepare and upload vectors
+        print("== Uploading vectors to Pinecone ==")
+        upsert_batch_size = 20
+        vectors = []
+
+        for chunk, embedding in zip(chunks, embeddings):
+            vector = {
+                "id": str(uuid.uuid4()),
+                "values": embedding,
+                "metadata": {
+                    "content": chunk,
+                    "file_reference": file.filename,
+                },
+            }
+            vectors.append(vector)
+
+            if len(vectors) == upsert_batch_size:
+                result = await upsert_records(vectors)
+                if not result:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Error uploading records to PineconeDB.",
+                    )
+                vectors = []
+                await asyncio.sleep(1)
+
+        # Upload remaining
+        if vectors:
+            result = await upsert_records(vectors)
+            if not result:
+                raise HTTPException(
+                    status_code = 500,
+                    detail = "Error uploading final records to PineconeDB.",
+                )
+
+        print("== File processing successful! ==")
+        return {"success": True, "message": "File processed successfully!"}
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"== Unexpected error: {e} ==")
+        return JSONResponse(
+            content = {
+                "success": False,
+                "message": f"Unexpected error while processing file: {str(e)}",
             },
-            headers = {
-                'Content-Type': 'application/json',
-                'api-key': txt_embedding_api_key
+            status_code = 500,
+        )
+
+
+async def generate_response(
+    query: str,
+    genai_client
+):
+    try:
+        # fetch context from pinecone
+        embedding = await generateEmbeddings([query])
+        pinecone_context = await query_records(
+            vector = embedding,
+            top_k = 5
+        )
+        print(f"context - {pinecone_context}")
+
+        prompt = f"""
+        You are a Specialized Diploma Study Bot designed to help students with academic and general Q&A.
+
+        Instructions:
+        - Use the RAG context only when it is relevant or helpful to the query. 
+          If the context doesn’t apply (e.g., casual greetings, generic questions), respond naturally without forcing it.
+        - If the context is partial or unclear, combine it with general academic knowledge intelligently.
+        - Always provide a well-structured, clear, and detailed answer.
+        - Keep the tone natural, friendly, and helpful — like a knowledgeable tutor.
+        - Maintain the same language as the input (English, Hindi, etc.).
+        - Organize the response logically using headings, bullet points, or steps when appropriate.
+
+        Note: RAG context will be provided - irrespective of the nature of the query
+
+        Student Query:
+        {query}
+
+        RAG Context:
+        {pinecone_context}
+        """
+        response = await genai_client.aio.models.generate_content_stream(
+            model = "gemini-2.0-flash",
+            contents = query,
+            config = {
+                "system_instruction": prompt
             }
         )
 
-        result = response.json()
-        embedding = result['data'][0]['embedding']
-        
-        return embedding
+        async for res in response:
+            if res.candidates[0].content.parts[0].text:
+                yield res.candidates[0].content.parts[0].text
+                await asyncio.sleep(0.125)
 
     except Exception as e:
-        print(e)
-        return []
+        yield f"There was an error while generating response: {e}"
 
 
-def PineconeInsert(chunks: List[str], embeddings: List[List[float]]) -> bool:
-    pc = Pinecone(api_key = os.getenv('PINECONE_API_KEY'))
-    index = pc.Index('ragtest-1')
-    
-    if len(chunks) != len(embeddings):
-        return False
-    
-    for chunk, embedding in zip(chunks, embeddings):
-        try:
-            id = str(uuid.uuid4())
-            index.upsert(
-                vectors = [
-                    {
-                        'id': id,
-                        'values': embedding,
-                        'metadata': {
-                            'text': chunk
-                        }
-                    }
-                ],
-                namespace = 'PDFdocs'
-            )
-            
-        except Exception as e:
-            print(e)
-            return False
+@app.post("/chat")
+async def send_llm_response(
+    request_data = Body(...),
+    genai_client = Depends(get_genai_client),
+):
+    return StreamingResponse(generate_response(
+        query = request_data.get("query"),
+        genai_client = genai_client
+    ) , media_type="text/plain")
 
-    return True
-
-
-
-
-@app.route('/fileProcessing', methods = ['POST'])
-def fileProcessing():
-    if 'file' not in request.files:
-        return 'No file uploaded', 400
-    
-    file = request.files['file']
-
-    # save the file
-    with open(f'storedFiles/{file.filename}', 'wb') as f:
-        f.write(file.getbuffer())
-    f.close()
-
-    document = PyPDF2.PdfReader( file ) #extract the text
-    fileContent = ''
-    for page in document.pages:
-        fileContent += page.extract_text()
-
-    cleanContent = preProcessDocument( fileContent ) #preprocess the raw content
-
-    chunks = splitDocument( cleanContent ) #get the chunks
-    
-    embeddings = []
-    for chunk in chunks: 
-        embed = embedChunks( chunk ) #get embedding for each chunk
-        if embed == []:
-            return 'Embeddings falid for the document!', 400
-        embeddings.append( embed )
-    
-    PineconeInsert(chunks, embeddings) #insert the chunks into the database
-
-    return jsonify({'text': fileContent})
-
-
-def queryPinecone(query: str) -> str:
-    print('<--Pinecone DB call-->')
-    pc = Pinecone(api_key = os.getenv('PINECONE_API_KEY'))
-    index = pc.Index('ragtest-1')
-
-    vector = embedChunks( query )
-
-    result = index.query(
-        namespace = 'PDFdocs',
-        vector = vector,
-        include_metadata = True,
-        top_k = 5
-    )
-
-    # process the result to only get the text
-    data = ''
-    for match in result['matches']:
-        data = data + match['metadata']['text']
-    
-    return data # return the data
-
-
-getDataFromPinecone = {
-    'name': 'getDataFromPinecone',
-    'description': 'Retrieves relevant information from the Pinecone vector database based on a semantic Retrieval-Augmented Generation search.',
-    'parameters': {
-        'type': 'object',
-        'properties': {
-            'query': {
-                'type': 'string',
-                'description': 'A natural language description of the information the user is seeking.'
-            }
-        },
-        'required': ['query']
-    }
-}
-
-
-def generateResponse(query: str):
-    client = genai.Client(api_key = os.getenv('GEMINI_API_KEY'))
-
-    tools = types.Tool(
-        function_declarations = [getDataFromPinecone]
-    )
-
-    system_instruction = """
-        Role: You are a helpful **insurance assistant** that guides users with information about 
-        insurance policies (**car**, **health**, and **full life**) and also handles general 
-        insurance-related or conversational queries.
-
-        Tasks: 
-        - Use the `getDataFromPinecone` tool to retrieve relevant information from a Pinecone-based 
-          knowledge base (e.g., policy terms, benefits, exclusions).
-        - Answer general questions about insurance or assist with common queries when retrieval is not required.
-
-        Tool Access:
-        - `getDataFromPinecone(query: string)`  
-           Use this to semantically search the document database when the query may relate to stored policy content.
-        
-        When to Use Retrieval
-        Use the tool when:
-        - The user asks about specific policy details.
-        - When asked about insurance company
-        - The query likely references uploaded or indexed documents.
-
-        When to Answer Directly
-        Respond directly when:
-        - The question is general (e.g., “What is life insurance?”).
-        - It’s conversational or doesn’t need document-based lookup.
-
-        Behavior Guidelines
-        - Clearly mention when an answer is based on retrieved information.
-        - Provide helpful, and easy-to-understand responses.
-        - Give Detailed responses
-        - Beautify the outputs (make use of emojis, give responses point - wise, etc)   
-        """
-
-    config = types.GenerateContentConfig(
-        system_instruction = system_instruction,
-        tools = [tools]
-    )
-
-    response = client.models.generate_content_stream(
-        model='gemini-2.0-flash',
-        contents=[query],
-        config = config
-    )
-
-    for chunk in response:
-        if chunk.candidates[0].content.parts[0].text:
-            yield chunk.candidates[0].content.parts[0].text
-            time.sleep(0.125)
-        if chunk.candidates[0].content.parts[0].function_call:
-            toolCall = chunk.candidates[0].content.parts[0].function_call
-            toolName = toolCall.name
-            args = toolCall.args
-            arg = args['query']
-
-            if toolName == 'getDataFromPinecone':
-                context = queryPinecone( **toolCall.args )
-
-                function_response_part = types.Part.from_function_response(
-                    name=toolName,
-                    response={"result": context},
-                )
-
-                contents = []
-                contents.append(
-                    types.Content(
-                        role = 'model',
-                        parts = [
-                            types.Part(
-                                function_call = toolCall
-                            )
-                        ]
-                    )
-                )
-
-                contents.append(
-                    types.Content(
-                        role = 'user',
-                        parts = [ function_response_part ]
-                    )
-                )
-
-                finalResponse = client.models.generate_content_stream(
-                    model = 'gemini-2.0-flash',
-                    config = config,
-                    contents = contents
-                )
-
-                #stream the final response
-                for res in finalResponse:
-                    if res.candidates[0].content.parts[0].text:
-                        yield res.candidates[0].content.parts[0].text
-                        time.sleep(0.125)
-                
-
-
-@app.route('/chat', methods = ['POST'])
-def chat():
-    query = request.json.get('query')
-
-    return Response(generateResponse(query), mimetype='text/plain')
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    import uvicorn
+
+    uvicorn.run(
+        "server:app",  
+        host = "0.0.0.0",  
+        port = 8000,
+        reload = True,
+        log_level = "info"
+    )
 

@@ -6,7 +6,7 @@ import streamlit as st
 st.set_page_config(page_title="Welcome to Chatbot", page_icon="💬")
 
 # page title
-st.title('Welcome to :blue[Insurance] chatBot!')
+st.title('Welcome to :blue[Diploma Help] chatBot!')
 
 # chat history
 if 'messageHistory' not in st.session_state:
@@ -30,7 +30,7 @@ if query:
 
     # agent response
     with st.chat_message('ai'):
-        chatEndpoint = 'http://localhost:5000/chat'
+        chatEndpoint = 'http://localhost:8000/chat'
         
         responseStream = requests.post(
             chatEndpoint,
