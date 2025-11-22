@@ -76,3 +76,21 @@ async def upsert_records(
     except Exception as e:
         print(f"== An error occured while upserting vectors to pineconeDB: {e} ==")
         return False
+    
+async def delete_pinecone_vectors(
+    pinecone_ids,
+    namespace: str = "diploma_studies_project"
+):
+    try:
+        print("==Pinecone delete called==")
+        if pinecone_index is None:
+            raise Exception("Pinecone connection not initiated") 
+        
+        await pinecone_index.delete(
+            ids = pinecone_ids,
+            namespace = namespace
+        )
+    
+    except Exception as e:
+        print(f"== Error while deleting the vectors: {e} ==")
+        raise Exception(f"Error while deleting the vectors: {e}")

@@ -1,67 +1,78 @@
-import os
 import requests
 import streamlit as st
 
-# page header
+# ---------------------------
+# Page Settings
+# ---------------------------
 st.set_page_config(page_title="Welcome to Chatbot", page_icon="💬")
+st.title("Welcome to :blue[Diploma Help] ChatBot!")
 
-# page title
-st.title('Welcome to :blue[Diploma Help] chatBot!')
+CHAT_ENDPOINT = "http://localhost:8000/chat"
 
-# chat history
-if 'messageHistory' not in st.session_state:
+
+# ---------------------------
+# Session State for Chat History
+# ---------------------------
+if "messageHistory" not in st.session_state:
     st.session_state.messageHistory = []
 
-for message in st.session_state.messageHistory:
-    with st.chat_message(message['role']):
-        st.markdown(message['content'])
 
-# chat input
-query = st.chat_input(
-    placeholder = 'Write your query',
-    key = 'queryInput', # used to uniquely identify the widget
-    # on_submit = 'callback'
-)
+# ---------------------------
+# Display Chat History
+# ---------------------------
+for message in st.session_state.messageHistory:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+
+# ---------------------------
+# Chat Input
+# ---------------------------
+query = st.chat_input("Write your query")
 
 if query:
-    # user query
-    with st.chat_message('user'):
+
+    # Show user's message
+    with st.chat_message("user"):
         st.markdown(query)
 
-    # agent response
-    with st.chat_message('ai'):
-        chatEndpoint = 'http://localhost:8000/chat'
-        
-        responseStream = requests.post(
-            chatEndpoint,
-            json = {
-                'query': query
-            }, 
-            stream = True
-        )
-        
-        # decode and stream the response
-        res = ''
+    # Prepare response container
+    with st.chat_message("ai"):
         placeholder = st.empty()
-        for chunk in responseStream.iter_content(chunk_size = None):
-            if chunk:
-                decode = chunk.decode('utf-8')
-                res = res + decode
-                placeholder.markdown(res)
+
+        try:
+            if len(st.session_state.messageHistory) >= 2:
+                message_history = st.session_state.messageHistory[-2:]
+            else: message_history = []
+            with st.spinner("Thinking..."):
+                response_stream = requests.post(
+                    CHAT_ENDPOINT,
+                    json={
+                        "query": query,
+                        "message_history": message_history
+                    },
+                    stream=True,
+                    timeout=90
+                )
+
+            # Stream the response text
+            result_text = ""
+
+            for chunk in response_stream.iter_content(chunk_size=None):
+                if chunk:
+                    decoded = chunk.decode("utf-8", errors="ignore")
+                    result_text += decoded
+                    placeholder.markdown(result_text)
+
+        except requests.exceptions.RequestException as e:
+            result_text = "❌ Backend is unavailable. Please try again later."
+            placeholder.error(result_text)
 
 
-    # store the message into the state
-    newMessages = [
-        {
-            'role': 'user',
-            'content': query
-        },
-
-        {
-            'role': 'ai',
-            'content': res
-        }
-    ]
-
-    #store the messages
-    st.session_state.messageHistory.extend(newMessages)
+    # Save conversation to session state
+    st.session_state.messageHistory.append(
+        {"role": "user", "content": query}
+    )
+    st.session_state.messageHistory.append(
+        {"role": "ai", "content": result_text}
+    )

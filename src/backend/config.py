@@ -10,4 +10,7 @@ class settings(BaseSettings):
     PINECONE_API_KEY: str = os.environ.get("PINECONE_API_KEY")
     PINECONE_HOST: str = os.environ.get("PINECONE_HOST")
 
+    MONGO_URL: str = os.environ.get("MONGO_URL") 
+    DB_NAME: str = os.environ.get("DB_NAME")
+
 config = settings()
